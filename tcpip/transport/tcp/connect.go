@@ -57,6 +57,9 @@ type handshake struct {
 	flags  uint8
 	ackNum seqnum.Value
 
+	// irs is the initial receive sequence number, as defined in RFC 793.
+	irs seqnum.Value
+
 	// iss is the initial send sequence number, as defined in RFC 793.
 	iss seqnum.Value
 
@@ -142,6 +145,7 @@ func (h *handshake) resetToSynRcvd(iss seqnum.Value, irs seqnum.Value, opts *hea
 	h.state = handshakeSynRcvd
 	h.flags = flagSyn | flagAck
 	h.iss = iss
+	h.irs = irs
 	h.ackNum = irs + 1
 	h.mss = opts.MSS
 	h.sndWndScale = opts.WS

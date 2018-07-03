@@ -220,6 +220,13 @@ type endpoint struct {
 	// The following are only used to assist the restore run to re-connect.
 	bindAddress       tcpip.Address
 	connectingAddress tcpip.Address
+
+	irs seqnum.Value
+	iss seqnum.Value
+}
+
+func (e *endpoint) IRS() seqnum.Value {
+	return e.irs
 }
 
 func newEndpoint(stack *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) *endpoint {

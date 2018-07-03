@@ -213,6 +213,9 @@ func (l *listenContext) createConnectedEndpoint(s *segment, iss seqnum.Value, ir
 	n.isRegistered = true
 	n.state = stateConnected
 
+	n.iss = iss
+	n.irs = irs
+
 	// Create sender and receiver.
 	//
 	// The receiver at least temporarily has a zero receive window scale,

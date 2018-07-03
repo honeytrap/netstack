@@ -144,6 +144,9 @@ type endpoint struct {
 	// sack holds TCP SACK related information for this endpoint.
 	sack SACKInfo
 
+	// noReset disables sending RST packets for unknown destination packets
+	noReset bool
+
 	// The options below aren't implemented, but we remember the user
 	// settings because applications expect to be able to set/query these
 	// options.

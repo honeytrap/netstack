@@ -43,6 +43,10 @@ const (
 // protocol. See: https://tools.ietf.org/html/rfc2018.
 type SACKEnabled bool
 
+// RSTDisabled option can be used to enable SACK support in the TCP
+// protocol. See: https://tools.ietf.org/html/rfc2018.
+type RSTDisabled bool
+
 // SendBufferSizeOption allows the default, min and max send buffer sizes for
 // TCP endpoints to be queried or configured.
 type SendBufferSizeOption struct {
@@ -69,6 +73,7 @@ type AvailableCongestionControlOption string
 type protocol struct {
 	mu                         sync.Mutex
 	sackEnabled                bool
+	rstDisabled                bool
 	sendBufferSize             SendBufferSizeOption
 	recvBufferSize             ReceiveBufferSizeOption
 	congestionControl          string
@@ -105,7 +110,7 @@ func (*protocol) ParsePorts(v buffer.View) (src, dst uint16, err *tcpip.Error) {
 // a reset is sent in response to any incoming segment except another reset. In
 // particular, SYNs addressed to a non-existent connection are rejected by this
 // means."
-func (*protocol) HandleUnknownDestinationPacket(r *stack.Route, id stack.TransportEndpointID, vv *buffer.VectorisedView) bool {
+func (p *protocol) HandleUnknownDestinationPacket(r *stack.Route, id stack.TransportEndpointID, vv *buffer.VectorisedView) bool {
 	s := newSegment(r, id, vv)
 	defer s.decRef()
 
@@ -118,7 +123,10 @@ func (*protocol) HandleUnknownDestinationPacket(r *stack.Route, id stack.Transpo
 		return true
 	}
 
-	replyWithReset(s)
+	if !p.rstDisabled {
+		replyWithReset(s)
+	}
+
 	return true
 }
 
@@ -138,6 +146,12 @@ func replyWithReset(s *segment) {
 // SetOption implements TransportProtocol.SetOption.
 func (p *protocol) SetOption(option interface{}) *tcpip.Error {
 	switch v := option.(type) {
+	case RSTDisabled:
+		p.mu.Lock()
+		p.rstDisabled = bool(v)
+		p.mu.Unlock()
+		return nil
+
 	case SACKEnabled:
 		p.mu.Lock()
 		p.sackEnabled = bool(v)
@@ -180,6 +194,12 @@ func (p *protocol) SetOption(option interface{}) *tcpip.Error {
 // Option implements TransportProtocol.Option.
 func (p *protocol) Option(option interface{}) *tcpip.Error {
 	switch v := option.(type) {
+	case *RSTDisabled:
+		p.mu.Lock()
+		*v = RSTDisabled(p.rstDisabled)
+		p.mu.Unlock()
+		return nil
+
 	case *SACKEnabled:
 		p.mu.Lock()
 		*v = SACKEnabled(p.sackEnabled)

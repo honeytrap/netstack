@@ -195,20 +195,6 @@ func (e *endpoint) capViews(n int, buffers []int) int {
 	return len(buffers)
 }
 
-func (e *endpoint) allocateViews(bufConfig []int) {
-	for i, v := range e.views {
-		if v != nil {
-			break
-		}
-		b := buffer.NewView(bufConfig[i])
-		e.views[i] = b
-		e.iovecs[i] = syscall.Iovec{
-			Base: &b[0],
-			Len:  uint64(len(b)),
-		}
-	}
-}
-
 // dispatch reads one packet from the file descriptor and dispatches it.
 func (e *endpoint) dispatch(largeV buffer.View) (bool, *tcpip.Error) {
 	e.allocateViews(BufConfig)

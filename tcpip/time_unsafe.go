@@ -12,18 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build !linux
+// +build go1.9
+// +build !go1.12
 
-// Package rand implements a cryptographically secure pseudorandom number
-// generator.
-package rand
+package tcpip
 
-import "crypto/rand"
+import (
+	_ "time"   // Used with go:linkname.
+	_ "unsafe" // Required for go:linkname.
+)
 
-// Reader is the default reader.
-var Reader = rand.Reader
+// StdClock implements Clock with the time package.
+type StdClock struct{}
 
-// Read implements io.Reader.Read.
-func Read(b []byte) (int, error) {
-	return rand.Read(b)
+var _ Clock = (*StdClock)(nil)
+
+//go:linkname now time.now
+func now() (sec int64, nsec int32, mono int64)
+
+// NowNanoseconds implements Clock.NowNanoseconds.
+func (*StdClock) NowNanoseconds() int64 {
+	sec, nsec, _ := now()
+	return sec*1e9 + int64(nsec)
+}
+
+// NowMonotonic implements Clock.NowMonotonic.
+func (*StdClock) NowMonotonic() int64 {
+	_, _, mono := now()
+	return mono
 }

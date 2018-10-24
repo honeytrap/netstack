@@ -12,18 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build !linux
-
-// Package rand implements a cryptographically secure pseudorandom number
-// generator.
-package rand
-
-import "crypto/rand"
-
-// Reader is the default reader.
-var Reader = rand.Reader
-
-// Read implements io.Reader.Read.
-func Read(b []byte) (int, error) {
-	return rand.Read(b)
-}
+// Empty assembly file so empty func definitions work.

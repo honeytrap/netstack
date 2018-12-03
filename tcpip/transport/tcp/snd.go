@@ -17,6 +17,7 @@ package tcp
 import (
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/netstack/sleep"
@@ -400,15 +401,67 @@ func (s *sender) sendData() {
 		}
 	}
 
-	// TODO: We currently don't merge multiple send buffers
-	// into one segment if they happen to fit. We should do that
-	// eventually.
-	var seg *segment
+	seg := s.writeNext
 	end := s.sndUna.Add(s.sndWnd)
-	for seg = s.writeNext; seg != nil && s.outstanding < s.sndCwnd; seg = seg.Next() {
+	var dataSent bool
+	for ; seg != nil && s.outstanding < s.sndCwnd; seg = seg.Next() {
+
 		// We abuse the flags field to determine if we have already
 		// assigned a sequence number to this segment.
 		if seg.flags == 0 {
+			// Merge segments if allowed.
+			if seg.data.Size() != 0 {
+				available := int(seg.sequenceNumber.Size(end))
+				if available > limit {
+					available = limit
+				}
+
+				// nextTooBig indicates that the next segment was too
+				// large to entirely fit in the current segment. It would
+				// be possible to split the next segment and merge the
+				// portion that fits, but unexpectedly splitting segments
+				// can have user visible side-effects which can break
+				// applications. For example, RFC 7766 section 8 says
+				// that the length and data of a DNS response should be
+				// sent in the same TCP segment to avoid triggering bugs
+				// in poorly written DNS implementations.
+				var nextTooBig bool
+
+				for seg.Next() != nil && seg.Next().data.Size() != 0 {
+					if seg.data.Size()+seg.Next().data.Size() > available {
+						nextTooBig = true
+						break
+					}
+
+					seg.data.Append(seg.Next().data)
+
+					// Consume the segment that we just merged in.
+					s.writeList.Remove(seg.Next())
+				}
+
+				if !nextTooBig && seg.data.Size() < available {
+					// Segment is not full.
+					if s.outstanding > 0 && atomic.LoadUint32(&s.ep.delay) != 0 {
+						// Nagle's algorithm. From Wikipedia:
+						//   Nagle's algorithm works by combining a number of
+						//   small outgoing messages and sending them all at
+						//   once. Specifically, as long as there is a sent
+						//   packet for which the sender has received no
+						//   acknowledgment, the sender should keep buffering
+						//   its output until it has a full packet's worth of
+						//   output, thus allowing output to be sent all at
+						//   once.
+						break
+					}
+					if atomic.LoadUint32(&s.ep.cork) != 0 {
+						// Hold back the segment until full.
+						break
+					}
+				}
+			}
+
+			// Assign flags. We don't do it above so that we can merge
+			// additional data if Nagle holds the segment.
 			seg.sequenceNumber = s.sndNxt
 			seg.flags = flagAck | flagPsh
 		}
@@ -448,6 +501,12 @@ func (s *sender) sendData() {
 			segEnd = seg.sequenceNumber.Add(seqnum.Size(seg.data.Size()))
 		}
 
+		if !dataSent {
+			dataSent = true
+			// We are sending data, so we should stop the keepalive timer to
+			// ensure that no keepalives are sent while there is pending data.
+			s.ep.disableKeepaliveTimer()
+		}
 		s.sendSegment(seg.data, seg.flags, seg.sequenceNumber)
 
 		// Update sndNxt if we actually sent new data (as opposed to

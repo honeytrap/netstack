@@ -165,10 +165,19 @@ type endpoint struct {
 	// noReset disables sending RST packets for unknown destination packets
 	noReset bool
 
+	// delay enables Nagle's algorithm.
+	//
+	// delay is a boolean (0 is false) and must be accessed atomically.
+	delay uint32
+
+	// cork holds back segments until full.
+	//
+	// cork is a boolean (0 is false) and must be accessed atomically.
+	cork uint32
+
 	// The options below aren't implemented, but we remember the user
 	// settings because applications expect to be able to set/query these
 	// options.
-	noDelay   bool
 	reuseAddr bool
 
 	// segmentQueue is used to hand received segments to the protocol
@@ -253,6 +262,16 @@ func (e *endpoint) IRS() seqnum.Value {
 	return e.irs
 }
 
+// StopWork halts packet processing. Only to be used in tests.
+func (e *endpoint) StopWork() {
+	e.workMu.Lock()
+}
+
+// ResumeWork resumes packet processing. Only to be used in tests.
+func (e *endpoint) ResumeWork() {
+	e.workMu.Unlock()
+}
+
 // keepalive is a synchronization wrapper used to appease stateify. See the
 // comment in endpoint, where it is used.
 //
@@ -276,7 +295,6 @@ func newEndpoint(stack *stack.Stack, netProto tcpip.NetworkProtocolNumber, waite
 		rcvBufSize:  DefaultBufferSize,
 		sndBufSize:  DefaultBufferSize,
 		sndMTU:      int(math.MaxInt32),
-		noDelay:     false,
 		reuseAddr:   true,
 		keepalive: keepalive{
 			// Linux defaults.
@@ -643,10 +661,28 @@ func (e *endpoint) zeroReceiveWindow(scale uint8) bool {
 // SetSockOpt sets a socket option.
 func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
 	switch v := opt.(type) {
-	case tcpip.NoDelayOption:
-		e.mu.Lock()
-		e.noDelay = v != 0
-		e.mu.Unlock()
+	case tcpip.DelayOption:
+		if v == 0 {
+			atomic.StoreUint32(&e.delay, 0)
+
+			// Handle delayed data.
+			e.sndWaker.Assert()
+		} else {
+			atomic.StoreUint32(&e.delay, 1)
+		}
+
+		return nil
+
+	case tcpip.CorkOption:
+		if v == 0 {
+			atomic.StoreUint32(&e.cork, 0)
+
+			// Handle the corked data.
+			e.sndWaker.Assert()
+		} else {
+			atomic.StoreUint32(&e.cork, 1)
+		}
+
 		return nil
 
 	case tcpip.ReuseAddressOption:
@@ -812,13 +848,16 @@ func (e *endpoint) GetSockOpt(opt interface{}) *tcpip.Error {
 		*o = tcpip.ReceiveQueueSizeOption(v)
 		return nil
 
-	case *tcpip.NoDelayOption:
-		e.mu.RLock()
-		v := e.noDelay
-		e.mu.RUnlock()
-
+	case *tcpip.DelayOption:
 		*o = 0
-		if v {
+		if v := atomic.LoadUint32(&e.delay); v != 0 {
+			*o = 1
+		}
+		return nil
+
+	case *tcpip.CorkOption:
+		*o = 0
+		if v := atomic.LoadUint32(&e.cork); v != 0 {
 			*o = 1
 		}
 		return nil
@@ -1577,15 +1616,15 @@ func (e *endpoint) completeState() stack.TCPEndpointState {
 
 	if cubic, ok := e.snd.cc.(*cubicState); ok {
 		s.Sender.Cubic = stack.TCPCubicState{
-			WMax:                    cubic.wMax,
-			WLastMax:                cubic.wLastMax,
-			T:                       cubic.t,
+			WMax:     cubic.wMax,
+			WLastMax: cubic.wLastMax,
+			T:        cubic.t,
 			TimeSinceLastCongestion: time.Since(cubic.t),
-			C:                       cubic.c,
-			K:                       cubic.k,
-			Beta:                    cubic.beta,
-			WC:                      cubic.wC,
-			WEst:                    cubic.wEst,
+			C:    cubic.c,
+			K:    cubic.k,
+			Beta: cubic.beta,
+			WC:   cubic.wC,
+			WEst: cubic.wEst,
 		}
 	}
 	return s

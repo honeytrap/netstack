@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2019 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,18 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build linux,!amd64
+// +build linux
 
-package rawfile
+package fdbased
 
 import (
-	"syscall"
+	"reflect"
 	"unsafe"
 )
 
-// BlockingPoll is just a stub function that forwards to the poll() system call
-// on non-amd64 platforms.
-func BlockingPoll(fds *PollEvent, nfds int, timeout int64) (int, syscall.Errno) {
-	n, _, e := syscall.Syscall(syscall.SYS_POLL, uintptr(unsafe.Pointer(fds)), uintptr(nfds), uintptr(timeout))
-	return int(n), e
+const virtioNetHdrSize = int(unsafe.Sizeof(virtioNetHdr{}))
+
+func vnetHdrToByteSlice(hdr *virtioNetHdr) (slice []byte) {
+	sh := (*reflect.SliceHeader)(unsafe.Pointer(&slice))
+	sh.Data = uintptr(unsafe.Pointer(hdr))
+	sh.Len = virtioNetHdrSize
+	sh.Cap = virtioNetHdrSize
+	return
 }

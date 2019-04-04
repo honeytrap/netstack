@@ -15,6 +15,7 @@
 package tcp
 
 import (
+	"fmt"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -116,6 +117,9 @@ type endpoint struct {
 	route             stack.Route
 	v6only            bool
 	isConnectNotified bool
+	// TCP should never broadcast but Linux nevertheless supports enabling/
+	// disabling SO_BROADCAST, albeit as a NOOP.
+	broadcast bool
 
 	// effectiveNetProtos contains the network protocols actually in use. In
 	// most cases it will only contain "netProto", but in cases like IPv6
@@ -165,6 +169,9 @@ type endpoint struct {
 	// noReset disables sending RST packets for unknown destination packets
 	noReset bool
 
+	// reusePort is set to true if SO_REUSEPORT is enabled.
+	reusePort bool
+
 	// delay enables Nagle's algorithm.
 	//
 	// delay is a boolean (0 is false) and must be accessed atomically.
@@ -175,10 +182,19 @@ type endpoint struct {
 	// cork is a boolean (0 is false) and must be accessed atomically.
 	cork uint32
 
+	// scoreboard holds TCP SACK Scoreboard information for this endpoint.
+	scoreboard *SACKScoreboard
+
 	// The options below aren't implemented, but we remember the user
 	// settings because applications expect to be able to set/query these
 	// options.
 	reuseAddr bool
+
+	// slowAck holds the negated state of quick ack. It is stubbed out and
+	// does nothing.
+	//
+	// slowAck is a boolean (0 is false) and must be accessed atomically.
+	slowAck uint32
 
 	// segmentQueue is used to hand received segments to the protocol
 	// goroutine. Segments are queued as long as the queue is not full,
@@ -256,6 +272,8 @@ type endpoint struct {
 
 	irs seqnum.Value
 	iss seqnum.Value
+
+	gso *stack.GSO
 }
 
 func (e *endpoint) IRS() seqnum.Value {
@@ -411,18 +429,18 @@ func (e *endpoint) Close() {
 
 	e.mu.Lock()
 
-	// We always release ports inline so that they are immediately available
-	// for reuse after Close() is called. If also registered, it means this
-	// is a listening socket, so we must unregister as well otherwise the
-	// next user would fail in Listen() when trying to register.
-	if e.isPortReserved {
-		e.stack.ReleasePort(e.effectiveNetProtos, ProtocolNumber, e.id.LocalAddress, e.id.LocalPort)
-		e.isPortReserved = false
-
+	// For listening sockets, we always release ports inline so that they
+	// are immediately available for reuse after Close() is called. If also
+	// registered, we unregister as well otherwise the next user would fail
+	// in Listen() when trying to register.
+	if e.state == stateListen && e.isPortReserved {
 		if e.isRegistered {
-			e.stack.UnregisterTransportEndpoint(e.boundNICID, e.effectiveNetProtos, ProtocolNumber, e.id)
+			e.stack.UnregisterTransportEndpoint(e.boundNICID, e.effectiveNetProtos, ProtocolNumber, e.id, e)
 			e.isRegistered = false
 		}
+
+		e.stack.ReleasePort(e.effectiveNetProtos, ProtocolNumber, e.id.LocalAddress, e.id.LocalPort)
+		e.isPortReserved = false
 	}
 
 	// Either perform the local cleanup or kick the worker to make sure it
@@ -457,7 +475,13 @@ func (e *endpoint) cleanupLocked() {
 	e.workerCleanup = false
 
 	if e.isRegistered {
-		e.stack.UnregisterTransportEndpoint(e.boundNICID, e.effectiveNetProtos, ProtocolNumber, e.id)
+		e.stack.UnregisterTransportEndpoint(e.boundNICID, e.effectiveNetProtos, ProtocolNumber, e.id, e)
+		e.isRegistered = false
+	}
+
+	if e.isPortReserved {
+		e.stack.ReleasePort(e.effectiveNetProtos, ProtocolNumber, e.id.LocalAddress, e.id.LocalPort)
+		e.isPortReserved = false
 	}
 
 	e.route.Release()
@@ -564,10 +588,6 @@ func (e *endpoint) Write(p tcpip.Payload, opts tcpip.WriteOptions) (uintptr, <-c
 		return 0, nil, perr
 	}
 
-	var err *tcpip.Error
-	if p.Size() > avail {
-		err = tcpip.ErrWouldBlock
-	}
 	l := len(v)
 	s := newSegmentFromView(&e.route, e.id, v)
 
@@ -586,7 +606,7 @@ func (e *endpoint) Write(p tcpip.Payload, opts tcpip.WriteOptions) (uintptr, <-c
 		// Let the protocol goroutine do the work.
 		e.sndWaker.Assert()
 	}
-	return uintptr(l), nil, err
+	return uintptr(l), nil, nil
 }
 
 // Peek reads data without consuming it from the endpoint.
@@ -670,7 +690,6 @@ func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
 		} else {
 			atomic.StoreUint32(&e.delay, 1)
 		}
-
 		return nil
 
 	case tcpip.CorkOption:
@@ -682,13 +701,26 @@ func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
 		} else {
 			atomic.StoreUint32(&e.cork, 1)
 		}
-
 		return nil
 
 	case tcpip.ReuseAddressOption:
 		e.mu.Lock()
 		e.reuseAddr = v != 0
 		e.mu.Unlock()
+		return nil
+
+	case tcpip.ReusePortOption:
+		e.mu.Lock()
+		e.reusePort = v != 0
+		e.mu.Unlock()
+		return nil
+
+	case tcpip.QuickAckOption:
+		if v == 0 {
+			atomic.StoreUint32(&e.slowAck, 1)
+		} else {
+			atomic.StoreUint32(&e.slowAck, 0)
+		}
 		return nil
 
 	case tcpip.ReceiveBufferSizeOption:
@@ -753,7 +785,6 @@ func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
 		e.sndBufMu.Lock()
 		e.sndBufSize = size
 		e.sndBufMu.Unlock()
-
 		return nil
 
 	case tcpip.V6OnlyOption:
@@ -771,34 +802,45 @@ func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
 		}
 
 		e.v6only = v != 0
+		return nil
 
 	case tcpip.KeepaliveEnabledOption:
 		e.keepalive.Lock()
 		e.keepalive.enabled = v != 0
 		e.keepalive.Unlock()
 		e.notifyProtocolGoroutine(notifyKeepaliveChanged)
+		return nil
 
 	case tcpip.KeepaliveIdleOption:
 		e.keepalive.Lock()
 		e.keepalive.idle = time.Duration(v)
 		e.keepalive.Unlock()
 		e.notifyProtocolGoroutine(notifyKeepaliveChanged)
+		return nil
 
 	case tcpip.KeepaliveIntervalOption:
 		e.keepalive.Lock()
 		e.keepalive.interval = time.Duration(v)
 		e.keepalive.Unlock()
 		e.notifyProtocolGoroutine(notifyKeepaliveChanged)
+		return nil
 
 	case tcpip.KeepaliveCountOption:
 		e.keepalive.Lock()
 		e.keepalive.count = int(v)
 		e.keepalive.Unlock()
 		e.notifyProtocolGoroutine(notifyKeepaliveChanged)
+		return nil
 
+	case tcpip.BroadcastOption:
+		e.mu.Lock()
+		e.broadcast = v != 0
+		e.mu.Unlock()
+		return nil
+
+	default:
+		return nil
 	}
-
-	return nil
 }
 
 // readyReceiveSize returns the number of bytes ready to be received.
@@ -873,6 +915,24 @@ func (e *endpoint) GetSockOpt(opt interface{}) *tcpip.Error {
 		}
 		return nil
 
+	case *tcpip.ReusePortOption:
+		e.mu.RLock()
+		v := e.reusePort
+		e.mu.RUnlock()
+
+		*o = 0
+		if v {
+			*o = 1
+		}
+		return nil
+
+	case *tcpip.QuickAckOption:
+		*o = 1
+		if v := atomic.LoadUint32(&e.slowAck); v != 0 {
+			*o = 0
+		}
+		return nil
+
 	case *tcpip.V6OnlyOption:
 		// We only recognize this option on v6 endpoints.
 		if e.netProto != header.IPv6ProtocolNumber {
@@ -900,7 +960,6 @@ func (e *endpoint) GetSockOpt(opt interface{}) *tcpip.Error {
 			o.RTTVar = snd.rtt.rttvar
 			snd.rtt.Unlock()
 		}
-
 		return nil
 
 	case *tcpip.KeepaliveEnabledOption:
@@ -912,25 +971,45 @@ func (e *endpoint) GetSockOpt(opt interface{}) *tcpip.Error {
 		if v {
 			*o = 1
 		}
+		return nil
 
 	case *tcpip.KeepaliveIdleOption:
 		e.keepalive.Lock()
 		*o = tcpip.KeepaliveIdleOption(e.keepalive.idle)
 		e.keepalive.Unlock()
+		return nil
 
 	case *tcpip.KeepaliveIntervalOption:
 		e.keepalive.Lock()
 		*o = tcpip.KeepaliveIntervalOption(e.keepalive.interval)
 		e.keepalive.Unlock()
+		return nil
 
 	case *tcpip.KeepaliveCountOption:
 		e.keepalive.Lock()
 		*o = tcpip.KeepaliveCountOption(e.keepalive.count)
 		e.keepalive.Unlock()
+		return nil
 
+	case *tcpip.OutOfBandInlineOption:
+		// We don't currently support disabling this option.
+		*o = 1
+		return nil
+
+	case *tcpip.BroadcastOption:
+		e.mu.Lock()
+		v := e.broadcast
+		e.mu.Unlock()
+
+		*o = 0
+		if v {
+			*o = 1
+		}
+		return nil
+
+	default:
+		return tcpip.ErrUnknownProtocolOption
 	}
-
-	return tcpip.ErrUnknownProtocolOption
 }
 
 func (e *endpoint) checkV4Mapped(addr *tcpip.FullAddress) (tcpip.NetworkProtocolNumber, *tcpip.Error) {
@@ -1025,7 +1104,7 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool, run bool) (er
 	}
 
 	// Find a route to the desired destination.
-	r, err := e.stack.FindRoute(nicid, e.id.LocalAddress, addr.Addr, netProto)
+	r, err := e.stack.FindRoute(nicid, e.id.LocalAddress, addr.Addr, netProto, false /* multicastLoop */)
 	if err != nil {
 		return err
 	}
@@ -1040,7 +1119,7 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool, run bool) (er
 
 	if e.id.LocalPort != 0 {
 		// The endpoint is bound to a port, attempt to register it.
-		err := e.stack.RegisterTransportEndpoint(nicid, netProtos, ProtocolNumber, e.id, e)
+		err := e.stack.RegisterTransportEndpoint(nicid, netProtos, ProtocolNumber, e.id, e, e.reusePort)
 		if err != nil {
 			return err
 		}
@@ -1054,13 +1133,13 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool, run bool) (er
 			if sameAddr && p == e.id.RemotePort {
 				return false, nil
 			}
-			if !e.stack.IsPortAvailable(netProtos, ProtocolNumber, e.id.LocalAddress, p) {
+			if !e.stack.IsPortAvailable(netProtos, ProtocolNumber, e.id.LocalAddress, p, false) {
 				return false, nil
 			}
 
 			id := e.id
 			id.LocalPort = p
-			switch e.stack.RegisterTransportEndpoint(nicid, netProtos, ProtocolNumber, id, e) {
+			switch e.stack.RegisterTransportEndpoint(nicid, netProtos, ProtocolNumber, id, e, e.reusePort) {
 			case nil:
 				e.id = id
 				return true, nil
@@ -1088,6 +1167,8 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool, run bool) (er
 	e.boundNICID = nicid
 	e.effectiveNetProtos = netProtos
 	e.connectingAddress = connectingAddr
+
+	e.initGSO()
 
 	// Connect in the restore phase does not perform handshake. Restore its
 	// connection setting here.
@@ -1217,7 +1298,7 @@ func (e *endpoint) Listen(backlog int) (err *tcpip.Error) {
 	}
 
 	// Register the endpoint.
-	if err := e.stack.RegisterTransportEndpoint(e.boundNICID, e.effectiveNetProtos, ProtocolNumber, e.id, e); err != nil {
+	if err := e.stack.RegisterTransportEndpoint(e.boundNICID, e.effectiveNetProtos, ProtocolNumber, e.id, e, e.reusePort); err != nil {
 		return err
 	}
 
@@ -1270,7 +1351,7 @@ func (e *endpoint) Accept() (tcpip.Endpoint, *waiter.Queue, *tcpip.Error) {
 }
 
 // Bind binds the endpoint to a specific local port and optionally address.
-func (e *endpoint) Bind(addr tcpip.FullAddress, commit func() *tcpip.Error) (err *tcpip.Error) {
+func (e *endpoint) Bind(addr tcpip.FullAddress) (err *tcpip.Error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -1298,7 +1379,7 @@ func (e *endpoint) Bind(addr tcpip.FullAddress, commit func() *tcpip.Error) (err
 		}
 	}
 
-	port, err := e.stack.ReservePort(netProtos, ProtocolNumber, addr.Addr, addr.Port)
+	port, err := e.stack.ReservePort(netProtos, ProtocolNumber, addr.Addr, addr.Port, e.reusePort)
 	if err != nil {
 		return err
 	}
@@ -1329,14 +1410,6 @@ func (e *endpoint) Bind(addr tcpip.FullAddress, commit func() *tcpip.Error) (err
 
 		e.boundNICID = nic
 		e.id.LocalAddress = addr.Addr
-	}
-
-	// Check the commit function.
-	if commit != nil {
-		if err := commit(); err != nil {
-			// The defer takes care of unwind.
-			return err
-		}
 	}
 
 	// Mark endpoint as bound.
@@ -1385,7 +1458,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, vv
 	}
 
 	e.stack.Stats().TCP.ValidSegmentsReceived.Increment()
-	if (s.flags & flagRst) != 0 {
+	if (s.flags & header.TCPFlagRst) != 0 {
 		e.stack.Stats().TCP.ResetsReceived.Increment()
 	}
 
@@ -1538,6 +1611,16 @@ func (e *endpoint) maybeEnableSACKPermitted(synOpts *header.TCPSynOptions) {
 	}
 }
 
+// maxOptionSize return the maximum size of TCP options.
+func (e *endpoint) maxOptionSize() (size int) {
+	var maxSackBlocks [header.TCPMaxSACKBlocks]header.SACKBlock
+	options := e.makeOptions(maxSackBlocks[:])
+	size = len(options)
+	putOptions(options)
+
+	return size
+}
+
 // completeState makes a full copy of the endpoint and returns it. This is used
 // before invoking the probe. The state returned may not be fully consistent if
 // there are intervening syscalls when the state is being copied.
@@ -1564,6 +1647,7 @@ func (e *endpoint) completeState() stack.TCPEndpointState {
 	s.SACKPermitted = e.sackPermitted
 	s.SACK.Blocks = make([]header.SACKBlock, e.sack.NumBlocks)
 	copy(s.SACK.Blocks, e.sack.Blocks[:e.sack.NumBlocks])
+	s.SACK.ReceivedBlocks, s.SACK.MaxSACKED = e.scoreboard.Copy()
 
 	// Copy endpoint send state.
 	e.sndBufMu.Lock()
@@ -1616,16 +1700,38 @@ func (e *endpoint) completeState() stack.TCPEndpointState {
 
 	if cubic, ok := e.snd.cc.(*cubicState); ok {
 		s.Sender.Cubic = stack.TCPCubicState{
-			WMax:     cubic.wMax,
-			WLastMax: cubic.wLastMax,
-			T:        cubic.t,
+			WMax:                    cubic.wMax,
+			WLastMax:                cubic.wLastMax,
+			T:                       cubic.t,
 			TimeSinceLastCongestion: time.Since(cubic.t),
-			C:    cubic.c,
-			K:    cubic.k,
-			Beta: cubic.beta,
-			WC:   cubic.wC,
-			WEst: cubic.wEst,
+			C:                       cubic.c,
+			K:                       cubic.k,
+			Beta:                    cubic.beta,
+			WC:                      cubic.wC,
+			WEst:                    cubic.wEst,
 		}
 	}
 	return s
+}
+
+func (e *endpoint) initGSO() {
+	if e.route.Capabilities()&stack.CapabilityGSO == 0 {
+		return
+	}
+
+	gso := &stack.GSO{}
+	switch e.netProto {
+	case header.IPv4ProtocolNumber:
+		gso.Type = stack.GSOTCPv4
+		gso.L3HdrLen = header.IPv4MinimumSize
+	case header.IPv6ProtocolNumber:
+		gso.Type = stack.GSOTCPv6
+		gso.L3HdrLen = header.IPv6MinimumSize
+	default:
+		panic(fmt.Sprintf("Unknown netProto: %v", e.netProto))
+	}
+	gso.NeedsCsum = true
+	gso.CsumOffset = header.TCPChecksumOffset()
+	gso.MaxSize = e.route.GSOMaxSize()
+	e.gso = gso
 }

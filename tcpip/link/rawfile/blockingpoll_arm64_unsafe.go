@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build !amd64,!arm64
-// +build linux
+// +build linux,arm64
+// +build !go1.13
 
+// This must be validated with Go 1.13 and future releases.
 package rawfile
 
 import (
@@ -25,6 +26,14 @@ import (
 // BlockingPoll is just a stub function that forwards to the poll() system call
 // on non-amd64 platforms.
 func BlockingPoll(fds *PollEvent, nfds int, timeout int64) (int, syscall.Errno) {
-	n, _, e := syscall.Syscall(syscall.SYS_POLL, uintptr(unsafe.Pointer(fds)), uintptr(nfds), uintptr(timeout))
+	var ts *syscall.Timespec = nil
+
+	if timeout != -1 {
+		timeSpec := syscall.NsecToTimespec(timeout * 1000000)
+		ts = &timeSpec
+	}
+
+	// we are using SYS_PPOLL here instead of SYS_POLL, because SYS_POLL isn't available on ARM64
+	n, _, e := syscall.Syscall6(syscall.SYS_PPOLL, uintptr(unsafe.Pointer(fds)), uintptr(nfds), uintptr(unsafe.Pointer(ts)), 0, 0, 0)
 	return int(n), e
 }

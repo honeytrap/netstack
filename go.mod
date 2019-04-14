@@ -1,3 +1,3 @@
-module github.com/honeytrap/netstack
+module github.com/google/netstack
 
 go 1.11
